@@ -1,0 +1,96 @@
+services:
+  traefik:
+    image: traefik:v2.10
+    container_name: traefik
+    restart: always
+    networks:
+      - ${REVERSE_PROXY_NETWORK}
+    ports:
+      - "80:80"
+      - "443:443"
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${REVERSE_PROXY_NETWORK}
+      - traefik.http.middlewares.https-redirect.redirectscheme.scheme=https
+      - traefik.http.middlewares.https-redirect.redirectscheme.permanent=true
+      - traefik.http.middlewares.limit.buffering.maxRequestBodyBytes=10000000
+      - traefik.http.middlewares.limit.buffering.maxResponseBodyBytes=10000000
+    command:
+      - --providers.docker
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.http.address=:80
+      - --entrypoints.https.address=:443
+      - --log.level=INFO
+      # Uncomment for production:
+      - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_ACME_EMAIL}
+      #- --certificatesresolvers.letsencrypt.acme.storage=/certificates/acme.json
+      #- --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - le-tls-certificates:/certificates
+
+  backend:
+    image: ${BACKEND_DOCKER_IMAGE}:latest
+    container_name: backend
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - env/.env
+      - env/db.env
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker
+    networks:
+      - ${REVERSE_PROXY_NETWORK}
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${REVERSE_PROXY_NETWORK}
+      - traefik.http.services.backend.loadbalancer.server.port=${SERVER_PORT}
+      - traefik.http.routers.backend-http.entrypoints=http
+      - traefik.http.routers.backend-http.rule=Host(`${BACKEND_DOMAIN}`)
+      - traefik.http.routers.backend-http.middlewares=https-redirect,limit
+      - traefik.http.routers.backend-https.entrypoints=https
+      - traefik.http.routers.backend-https.rule=Host(`${BACKEND_DOMAIN}`)
+      - traefik.http.routers.backend-https.tls=true
+      # Uncomment for production:
+      #- traefik.http.routers.backend-https.tls.certresolver=letsencrypt
+      - traefik.http.routers.backend-https.middlewares=limit
+    volumes:
+      - .:/app
+    command: ["./mvnw", "spring-boot:run"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${SERVER_PORT}${SERVER_SERVLET_CONTEXT_PATH}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    ports:
+      - "${SERVER_PORT}:${SERVER_PORT}"
+
+  db:
+    image: postgres:16-alpine
+    container_name: db
+    restart: always
+    env_file:
+      - env/db.env
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - ${REVERSE_PROXY_NETWORK}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  le-tls-certificates:
+  postgres-data:
+
+networks:
+  reverse-proxy-network:
+    external: true
